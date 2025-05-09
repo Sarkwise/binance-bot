@@ -1,96 +1,107 @@
-def get_current_price(symbol="BTCUSDT"):
-    ticker = client.get_symbol_ticker(symbol=symbol)
-    return float(ticker['price'])
-
-import requests
-
-from binance.client import Client
+import os
+import requests 
+import time
 import pandas as pd
-from ta.trend import SMAIndicator
+from binance.client import Client
+from ta.trend import SMAIndicator, MACD
 from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
 
-# 1. Set your Binance API credentials
-API_KEY = 'VJEu8nhUzelNe4NZAjRYxEzD7GFuwWuaVIGpgKhwpn1k2EjesSl7vEp3rGEWNs5l'
-API_SECRET = 'ktoj75wNhuFDKAOmL71hDIdwGatoIJUjubhKeZCKNPqElDw6fsvlGNR2f6ARkeXi'
+# Binance API credentials from environment variables
+API_KEY = os.getenv('BINANCE_API_KEY')
+API_SECRET = os.getenv('BINANCE_API_SECRET')
 
-# Telegram Bot Settings
-TELEGRAM_TOKEN = '7697892603:AAEpDNsR7DWmw2D8upj_N_N_hPADIjowYhs'
-CHAT_ID = '986048210'
+# Telegram Bot Settings from environment variables
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Exit Strategy Settings
+TAKE_PROFIT_PERCENT = 0.10  # 10%
+STOP_LOSS_PERCENT = 0.05    # 5%
+
+# Connect to Binance
+client = Client(API_KEY, API_SECRET)
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': message
-    }
+    payload = {'chat_id': CHAT_ID, 'text': message}
     requests.post(url, data=payload)
 
-# Exit Strategy
-TAKE_PROFIT_PERCENT = 0.02  # 2%
-STOP_LOSS_PERCENT = 0.01    # 1%
-
-
-# 2. Connect to Binance
-client = Client(API_KEY, API_SECRET)
-
-# 3. Function to get historical candlestick data
-def get_historical_klines(symbol="BTCUSDT", interval=Client.KLINE_INTERVAL_1HOUR, lookback="3 days ago UTC"):
+def get_historical_klines(symbol, interval=Client.KLINE_INTERVAL_1HOUR, lookback="3 days ago UTC"):
     klines = client.get_historical_klines(symbol, interval, lookback)
-    
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
         'close_time', 'quote_asset_volume', 'number_of_trades',
         'taker_buy_base', 'taker_buy_quote', 'ignore'
     ])
-    
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
     df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-    
     return df
 
-# 4. Add indicators
 def add_indicators(df):
     df['SMA_20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
     df['RSI_14'] = RSIIndicator(close=df['close'], window=14).rsi()
+
+    macd = MACD(close=df['close'])
+    df['MACD'] = macd.macd()
+    df['MACD_SIGNAL'] = macd.macd_signal()
+
+    bb = BollingerBands(close=df['close'])
+    df['BB_UPPER'] = bb.bollinger_hband()
+    df['BB_LOWER'] = bb.bollinger_lband()
     return df
 
-# 5. Main bot logic
-btc_data = get_historical_klines()
-btc_data = add_indicators(btc_data)
+def analyze_symbol(symbol):
+    df = get_historical_klines(symbol)
+    df = add_indicators(df)
 
-# 6. Basic buy/sell signal logic with Telegram alerts
-latest = btc_data.iloc[-1]
-previous = btc_data.iloc[-2]
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
 
-if (latest['RSI_14'] < 30) and (previous['close'] < previous['SMA_20']) and (latest['close'] > latest['SMA_20']):
-    signal = "📈 Buy Signal: Price may rise!"
-elif (latest['RSI_14'] > 70) and (previous['close'] > previous['SMA_20']) and (latest['close'] < latest['SMA_20']):
-    signal = "📉 Sell Signal: Price may fall!"
-else:
-    signal = "⏳ No clear signal. Hold position."
+    entry_price = None
+    position_type = None
 
-print(f"\n{signal}")
-send_telegram_message(signal)
+    buy_conditions = (
+        latest['RSI_14'] < 30 and
+        previous['close'] < previous['SMA_20'] and
+        latest['close'] > latest['SMA_20'] and
+        latest['MACD'] > latest['MACD_SIGNAL'] and
+        latest['close'] < latest['BB_LOWER']
+    )
 
-import time
+    sell_conditions = (
+        latest['RSI_14'] > 70 and
+        previous['close'] > previous['SMA_20'] and
+        latest['close'] < latest['SMA_20'] and
+        latest['MACD'] < latest['MACD_SIGNAL'] and
+        latest['close'] > latest['BB_UPPER']
+    )
 
-# Store entry price if signal is triggered
-entry_price = None
-position_type = None  # "BUY" or "SELL"
+    if buy_conditions:
+        signal = f"\U0001F4C8 Strong Buy Signal for {symbol}: Multiple indicators align for upside potential."
+        entry_price = latest['close']
+        position_type = "BUY"
+    elif sell_conditions:
+        signal = f"\U0001F4C9 Strong Sell Signal for {symbol}: Multiple indicators align for downside risk."
+        entry_price = latest['close']
+        position_type = "SELL"
+    else:
+        signal = f"\u23F3 No strong signal for {symbol}. Indicators do not align."
 
-if (latest['RSI_14'] < 30) and (previous['close'] < previous['SMA_20']) and (latest['close'] > latest['SMA_20']):
-    signal = "📈 Buy Signal: Price may rise!"
-    entry_price = latest['close']
-    position_type = "BUY"
-elif (latest['RSI_14'] > 70) and (previous['close'] > previous['SMA_20']) and (latest['close'] < latest['SMA_20']):
-    signal = "📉 Sell Signal: Price may fall!"
-    entry_price = latest['close']
-    position_type = "SELL"
-else:
-    signal = "⏳ No clear signal. Hold position."
+    print(f"\n{signal}")
+    send_telegram_message(signal)
 
-print(f"\n{signal}")
-send_telegram_message(signal)
+    if entry_price and position_type:
+        take_profit = entry_price * (1 + TAKE_PROFIT_PERCENT) if position_type == "BUY" else entry_price * (1 - TAKE_PROFIT_PERCENT)
+        stop_loss = entry_price * (1 - STOP_LOSS_PERCENT) if position_type == "BUY" else entry_price * (1 + STOP_LOSS_PERCENT)
 
+        send_telegram_message(f"{symbol} {position_type} Entry: {entry_price:.2f}\nTP: {take_profit:.2f}, SL: {stop_loss:.2f}")
 
+def main():
+    symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+    for symbol in symbols:
+        analyze_symbol(symbol)
+
+if __name__ == "__main__":
+    main()
